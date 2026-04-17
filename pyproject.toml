@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "claude-scheduler-channel"
+version = "0.1.0"
+description = "A Claude Code channel MCP server that pushes cron-scheduled prompts into a running session, so scheduled jobs share the live session's other channels (Telegram, Discord, etc.) and MCP servers."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [{ name = "Haoxuan Li" }]
+keywords = ["claude", "claude-code", "mcp", "scheduler", "cron", "channel"]
+classifiers = [
+  "Development Status :: 4 - Beta",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.10",
+  "Programming Language :: Python :: 3.11",
+  "Programming Language :: Python :: 3.12",
+  "Topic :: Utilities",
+]
+dependencies = [
+  "mcp>=1.0.0",
+  "apscheduler>=3.10.0",
+]
+
+[project.scripts]
+claude-scheduler-channel = "server:_cli"
+
+[project.urls]
+Homepage = "https://github.com/DerKleineLi/claude-scheduler-channel"
+Issues = "https://github.com/DerKleineLi/claude-scheduler-channel/issues"
+
+[tool.setuptools]
+py-modules = ["server"]
