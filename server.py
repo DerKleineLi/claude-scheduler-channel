@@ -133,7 +133,13 @@ async def fire_prompt(prompt: str, job_id: str, name: str) -> None:
 
 
 def schedule_existing_jobs() -> None:
-    """Register persisted jobs with APScheduler on startup."""
+    """Register persisted jobs with APScheduler on startup.
+
+    `misfire_grace_time=None` + `coalesce=True` make the job catch up after
+    any event-loop pause (Windows sleep, WSL2 VM idle-suspend, process pause)
+    instead of being silently skipped once the default 1-second grace expires.
+    Missed fires during a long pause collapse to one run at wake-up time.
+    """
     for job in load_jobs():
         try:
             scheduler.add_job(
@@ -142,6 +148,8 @@ def schedule_existing_jobs() -> None:
                 args=[job["prompt"], job["id"], job["name"]],
                 id=job["id"],
                 replace_existing=True,
+                misfire_grace_time=None,
+                coalesce=True,
             )
             log.info("loaded job %s (%s) cron=%r", job["name"], job["id"], job["cron"])
         except Exception as e:
@@ -246,6 +254,8 @@ async def call_tool(name: str, args: dict[str, Any]) -> list[types.TextContent]:
             args=[job["prompt"], job["id"], job["name"]],
             id=job["id"],
             replace_existing=True,
+            misfire_grace_time=None,
+            coalesce=True,
         )
         next_fire = scheduler.get_job(job_id).next_run_time
         return [
