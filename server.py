@@ -18,6 +18,7 @@ import asyncio
 import json
 import logging
 import uuid
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -322,10 +323,61 @@ INSTRUCTIONS = (
 )
 
 
+async def _wallclock_catchup_loop(interval_sec: int = 30, overdue_tol_sec: int = 5) -> None:
+    """Every ``interval_sec``, force-fire any job whose ``next_run_time`` is
+    more than ``overdue_tol_sec`` in the past.
+
+    Why this exists: APScheduler's AsyncIOScheduler schedules its internal
+    wake-up via ``loop.call_later(delta_seconds, ...)``, where the delta is
+    computed in wallclock but the countdown uses asyncio's *monotonic* clock.
+    If the WSL2 utility VM (or host) pauses for a while, monotonic time
+    freezes but wallclock jumps forward on resume. When the call_later
+    eventually fires, APScheduler then evaluates ``misfire_grace_time`` —
+    which we've set to None, so it *would* fire. But if the pause exceeds
+    the delta, the call_later never fires in monotonic time within the
+    session's lifetime, and the job is silently skipped.
+
+    This task runs independently on a short interval. Each tick it walks
+    jobs and, if any ``next_run_time`` is in the past, reschedules it to
+    "now + 1s" which forces APScheduler to fire it on the very next tick of
+    its own loop. APScheduler then recomputes the next cron occurrence
+    normally, so we don't double-fire.
+    """
+    while True:
+        try:
+            await asyncio.sleep(interval_sec)
+            now = datetime.now(timezone.utc)
+            for job in scheduler.get_jobs():
+                nr = job.next_run_time
+                if nr is None:
+                    continue
+                nr_utc = nr.astimezone(timezone.utc)
+                if nr_utc < now - timedelta(seconds=overdue_tol_sec):
+                    log.warning(
+                        "catch-up: job %s (%s) was due at %s (%.0fs ago); forcing fire",
+                        job.name, job.id, nr, (now - nr_utc).total_seconds(),
+                    )
+                    try:
+                        scheduler.modify_job(
+                            job.id,
+                            next_run_time=datetime.now(nr.tzinfo) + timedelta(seconds=1),
+                        )
+                    except Exception as e:
+                        log.exception("catch-up modify_job failed for %s: %s", job.id, e)
+        except asyncio.CancelledError:
+            return
+        except Exception as e:
+            log.exception("wallclock catch-up loop error (continuing): %s", e)
+
+
 async def main() -> None:
     async with stdio_server() as (read_stream, write_stream):
         scheduler.start()
         schedule_existing_jobs()
+        # Catch-up loop: rescues jobs whose next_run_time slid into the past
+        # during a VM/host pause (APScheduler's monotonic-clock timer can't
+        # recover from long pauses on its own).
+        asyncio.create_task(_wallclock_catchup_loop())
         init_opts = server.create_initialization_options(
             notification_options=NotificationOptions(),
             experimental_capabilities={"claude/channel": {}},
