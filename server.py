@@ -17,11 +17,20 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import os
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any
 
+from apscheduler.events import (
+    EVENT_JOB_ERROR,
+    EVENT_JOB_EXECUTED,
+    EVENT_JOB_MISSED,
+    EVENT_JOB_SUBMITTED,
+)
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
 
@@ -31,13 +40,29 @@ from mcp.shared.message import SessionMessage
 import mcp.types as types
 
 # ---------------------------------------------------------------------------
-# Logging — stderr only. stdout is the MCP transport.
+# Logging — stderr (captured by Claude Code MCP log) + rotating file so we
+# have persistent history across MCP restarts to diagnose missed-fire issues.
+# stdout is the MCP transport; do not write to it.
 # ---------------------------------------------------------------------------
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s scheduler: %(message)s",
-)
+LOG_DIR = Path.home() / ".claude" / "scheduler_channel"
+LOG_FILE = LOG_DIR / "debug.log"
+LOG_DIR.mkdir(parents=True, exist_ok=True)
+
+_fmt = logging.Formatter("%(asctime)s %(levelname)s scheduler: %(message)s")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s scheduler: %(message)s")
 log = logging.getLogger("scheduler")
+
+# Rotating file handler: 1 MB × 3 files = ~3 MB cap.
+_file_handler = RotatingFileHandler(LOG_FILE, maxBytes=1_000_000, backupCount=3, encoding="utf-8")
+_file_handler.setLevel(logging.DEBUG)
+_file_handler.setFormatter(_fmt)
+log.addHandler(_file_handler)
+log.setLevel(logging.DEBUG)
+
+# Also pipe APScheduler's own logger through the same file + stderr.
+_ap_log = logging.getLogger("apscheduler")
+_ap_log.setLevel(logging.INFO)
+_ap_log.addHandler(_file_handler)
 
 # ---------------------------------------------------------------------------
 # Cron normalization
@@ -215,6 +240,20 @@ async def list_tools() -> list[types.Tool]:
                 "required": ["id"],
             },
         ),
+        types.Tool(
+            name="tail_log",
+            description=(
+                "Return the last N lines of ~/.claude/scheduler_channel/debug.log. "
+                "Use for post-mortem on missed fires: look for catch-up warnings "
+                "(monotonic/wallclock drift) and event.missed / event.executed lines."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "lines": {"type": "integer", "default": 200, "description": "Number of trailing lines."},
+                },
+            },
+        ),
     ]
 
 
@@ -308,6 +347,17 @@ async def call_tool(name: str, args: dict[str, Any]) -> list[types.TextContent]:
         await fire_prompt(job["prompt"], job["id"], job["name"])
         return [types.TextContent(type="text", text=f"Fired '{job['name']}' now.")]
 
+    if name == "tail_log":
+        n = int(args.get("lines", 200))
+        if not LOG_FILE.exists():
+            return [types.TextContent(type="text", text=f"(no log at {LOG_FILE})")]
+        try:
+            with LOG_FILE.open("r", encoding="utf-8", errors="replace") as f:
+                lines = f.readlines()[-n:]
+            return [types.TextContent(type="text", text="".join(lines) or "(empty)")]
+        except Exception as e:
+            return [types.TextContent(type="text", text=f"tail_log error: {e}")]
+
     return [types.TextContent(type="text", text=f"Unknown tool: {name}")]
 
 
@@ -321,6 +371,28 @@ INSTRUCTIONS = (
     "and act on it, then (if appropriate) send a Telegram reply summarizing the result.\n\n"
     "Manage schedules with add_job, list_jobs, remove_job, and fire_now tools."
 )
+
+
+def _install_scheduler_event_listeners() -> None:
+    """Turn every APScheduler job-lifecycle event into a debug log line so
+    missing fires can be diagnosed after the fact from debug.log."""
+    def _on_submit(ev):
+        log.debug("event.submitted id=%s scheduled=%s", ev.job_id, ev.scheduled_run_time)
+
+    def _on_executed(ev):
+        log.info("event.executed id=%s scheduled=%s", ev.job_id, ev.scheduled_run_time)
+
+    def _on_missed(ev):
+        log.warning("event.missed id=%s scheduled=%s", ev.job_id, ev.scheduled_run_time)
+
+    def _on_error(ev):
+        log.error("event.error id=%s scheduled=%s exc=%s", ev.job_id, ev.scheduled_run_time, ev.exception)
+
+    scheduler.add_listener(_on_submit, EVENT_JOB_SUBMITTED)
+    scheduler.add_listener(_on_executed, EVENT_JOB_EXECUTED)
+    scheduler.add_listener(_on_missed, EVENT_JOB_MISSED)
+    scheduler.add_listener(_on_error, EVENT_JOB_ERROR)
+    log.info("scheduler event listeners installed")
 
 
 async def _wallclock_catchup_loop(interval_sec: int = 30, overdue_tol_sec: int = 5) -> None:
@@ -343,16 +415,39 @@ async def _wallclock_catchup_loop(interval_sec: int = 30, overdue_tol_sec: int =
     its own loop. APScheduler then recomputes the next cron occurrence
     normally, so we don't double-fire.
     """
+    prev_monotonic = time.monotonic()
+    prev_wall = time.time()
+    heartbeat_every = 10  # emit a heartbeat log every 10 ticks (~5 min) so long gaps are visible
+    tick = 0
     while True:
         try:
             await asyncio.sleep(interval_sec)
+            tick += 1
+            now_m = time.monotonic()
+            now_w = time.time()
+            # Expected ~interval_sec between ticks; anything >2× is a pause.
+            gap_m = now_m - prev_monotonic
+            gap_w = now_w - prev_wall
+            drift = gap_w - gap_m
+            if abs(drift) > 2.0:
+                log.warning(
+                    "catch-up: clock drift detected between ticks — monotonic_gap=%.1fs wallclock_gap=%.1fs drift=%.1fs (likely VM/host pause)",
+                    gap_m, gap_w, drift,
+                )
+            elif tick % heartbeat_every == 0:
+                log.debug("catch-up: heartbeat tick=%d monotonic_gap=%.1fs wallclock_gap=%.1fs", tick, gap_m, gap_w)
+            prev_monotonic = now_m
+            prev_wall = now_w
+
             now = datetime.now(timezone.utc)
+            overdue_found = 0
             for job in scheduler.get_jobs():
                 nr = job.next_run_time
                 if nr is None:
                     continue
                 nr_utc = nr.astimezone(timezone.utc)
                 if nr_utc < now - timedelta(seconds=overdue_tol_sec):
+                    overdue_found += 1
                     log.warning(
                         "catch-up: job %s (%s) was due at %s (%.0fs ago); forcing fire",
                         job.name, job.id, nr, (now - nr_utc).total_seconds(),
@@ -364,6 +459,10 @@ async def _wallclock_catchup_loop(interval_sec: int = 30, overdue_tol_sec: int =
                         )
                     except Exception as e:
                         log.exception("catch-up modify_job failed for %s: %s", job.id, e)
+            if overdue_found == 0 and tick % heartbeat_every == 0:
+                # attach next-run summary to the heartbeat (helps diagnose "why didn't it fire tomorrow either")
+                summary = [f"{j.name}->{j.next_run_time}" for j in scheduler.get_jobs()]
+                log.debug("catch-up: next_runs=%s", summary)
         except asyncio.CancelledError:
             return
         except Exception as e:
@@ -372,6 +471,8 @@ async def _wallclock_catchup_loop(interval_sec: int = 30, overdue_tol_sec: int =
 
 async def main() -> None:
     async with stdio_server() as (read_stream, write_stream):
+        log.info("scheduler mcp starting; debug.log=%s pid=%s", LOG_FILE, os.getpid())
+        _install_scheduler_event_listeners()
         scheduler.start()
         schedule_existing_jobs()
         # Catch-up loop: rescues jobs whose next_run_time slid into the past
