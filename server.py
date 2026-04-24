@@ -121,11 +121,47 @@ def save_jobs(jobs: list[dict[str, Any]]) -> None:
 # ---------------------------------------------------------------------------
 # MCP server + scheduler
 # ---------------------------------------------------------------------------
-server: Server = Server("scheduler")
-scheduler = AsyncIOScheduler()
-
-# Populated on first request. APScheduler callbacks read this to push.
+# Populated on first incoming client message (always the `initialize` request).
+# APScheduler callbacks read this to push. See CapturingServer below — this has
+# to be defined before the class because the class references it.
 _session: Any = None
+
+
+class CapturingServer(Server):
+    """Capture the session ref on the first incoming client message.
+
+    Why: `_session` used to be captured only inside `call_tool`, which meant
+    that if the user never explicitly invoked a scheduler tool after a CC
+    restart, `_session` stayed None and cron fires got silently dropped
+    ("no session captured; dropping fire"). The MCP lowlevel `_handle_message`
+    hook runs for every client message — including the very first `initialize`
+    request — so binding here means the session is ready before any cron can
+    possibly fire.
+    """
+
+    async def _handle_message(self, message, session, lifespan_context,
+                              raise_exceptions: bool = False):
+        global _session
+        if _session is None:
+            _session = session
+            # Unwrap to the innermost message type so the log is specific
+            # (e.g. `InitializedNotification`) instead of the outer envelope.
+            if hasattr(message, "request"):           # RequestResponder
+                inner = getattr(message.request, "root", message.request)
+            elif hasattr(message, "root"):            # ClientNotification
+                inner = message.root
+            else:
+                inner = message
+            log.info("captured session ref (on first incoming message: %s)",
+                     type(inner).__name__)
+        else:
+            log.debug("_handle_message: session already captured")
+        await super()._handle_message(message, session, lifespan_context,
+                                       raise_exceptions)
+
+
+server: Server = CapturingServer("scheduler")
+scheduler = AsyncIOScheduler()
 
 
 async def fire_prompt(prompt: str, job_id: str, name: str) -> None:
@@ -138,6 +174,7 @@ async def fire_prompt(prompt: str, job_id: str, name: str) -> None:
     if _session is None:
         log.warning("no session captured; dropping fire for %s (%s)", name, job_id)
         return
+    log.debug("fire_prompt: session=%s job_id=%s name=%s", id(_session), job_id, name)
     log.info("firing %s (%s)", name, job_id)
     try:
         raw = types.JSONRPCNotification(
@@ -258,19 +295,25 @@ async def list_tools() -> list[types.Tool]:
 
 
 def _capture_session() -> None:
-    """Capture the session ref so background cron firings can push."""
+    """Fallback session-capture path (kept for safety).
+
+    The primary capture now happens in `CapturingServer._handle_message`
+    on the first incoming message. This request-context path is retained
+    as a belt-and-suspenders fallback in case the subclass hook ever
+    misses (e.g. future MCP-SDK refactor).
+    """
     global _session
     if _session is None:
         try:
             _session = server.request_context.session
-            log.info("captured session ref")
+            log.info("captured session ref (fallback via request_context)")
         except Exception as e:
             log.warning("could not capture session: %s", e)
 
 
 @server.call_tool()
 async def call_tool(name: str, args: dict[str, Any]) -> list[types.TextContent]:
-    _capture_session()
+    _capture_session()  # no-op if CapturingServer already bound it
     jobs = load_jobs()
 
     if name == "add_job":
